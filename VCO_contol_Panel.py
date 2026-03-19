@@ -1035,7 +1035,6 @@ class CompensationWidget(QWidget):
         btns.addWidget(self.btn_store)
 
         root.addLayout(btns)
-        root.addStretch(1)  
 
         self._set_buttons_enabled(False)
         self._clear_meta()

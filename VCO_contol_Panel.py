@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QTabWidget, QLCDNumber,
     QButtonGroup, QSlider, QSizePolicy,
     QFileDialog, QDialog, QFormLayout,
-    QStyle
+    QStyle, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView
 )
 from PySide6.QtCore import QObject, Signal, QTimer, Qt
 from PySide6.QtGui import QRegularExpressionValidator, QIcon
@@ -295,6 +296,16 @@ def channel_from_text(text):
         return RFChannel()
     raise ValueError("Invalid channel")
 
+
+def filesystem_type_to_text(fs_type):
+    mapping = {
+        getattr(imslib, "FileSystemTypes_NO_FILE", None): "No File",
+        getattr(imslib, "FileSystemTypes_COMPENSATION_TABLE", None): "Compensation Table",
+        getattr(imslib, "FileSystemTypes_TONE_BUFFER", None): "Tone Buffer",
+        getattr(imslib, "FileSystemTypes_DDS_SCRIPT", None): "DDS Script",
+        getattr(imslib, "FileSystemTypes_USER_DATA", None): "User Data",
+    }
+    return mapping.get(fs_type, f"Unknown ({fs_type})")
 
 # -------------------------------------------------
 # Filter Controls
@@ -924,6 +935,238 @@ class RFDriveWidget(QGroupBox):
             "amp_en": bool(self.tgl_amp_enable.isChecked()),
         }
 
+# -------------------------------------------------
+# file table
+# -------------------------------------------------
+class DeviceFileTableWidget(QGroupBox):
+    def __init__(self, ims):
+        super().__init__("Stored Files on Device")
+        self.ims = ims
+
+        root = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Type", "Default"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)
+
+        self.table.setColumnWidth(1, 170)  
+        self.table.setColumnWidth(2, 300)   
+
+        root.addWidget(self.table)
+
+        btns = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_set_default = QPushButton("Set Default")
+        self.btn_clear_default = QPushButton("Clear Default")
+        self.btn_delete_selected = QPushButton("Delete Selected")
+        self.btn_delete_all = QPushButton("Delete All")
+
+        btns.addWidget(self.btn_refresh)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_set_default)
+        btns.addWidget(self.btn_clear_default)
+        btns.addWidget(self.btn_delete_selected)
+        btns.addWidget(self.btn_delete_all)
+
+        root.addLayout(btns)
+
+        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_set_default.clicked.connect(self.set_selected_default)
+        self.btn_clear_default.clicked.connect(self.clear_selected_default)
+        self.btn_delete_selected.clicked.connect(self.delete_selected)
+        self.btn_delete_all.clicked.connect(self.delete_all)
+
+        if self.ims == "trial_mode":
+            for btn in (
+                self.btn_refresh,
+                self.btn_set_default,
+                self.btn_clear_default,
+                self.btn_delete_selected,
+                self.btn_delete_all,
+            ):
+                btn.setEnabled(False)
+                btn.setToolTip("Trial mode: no device connected")
+            self.table.setRowCount(0)
+        else:
+            self.refresh()
+
+    def _viewer(self):
+        viewer = imslib.FileSystemTableViewer(self.ims)
+        if hasattr(viewer, "IsValid") and not bool(viewer.IsValid):
+            raise RuntimeError("Could not read device file table.")
+        return viewer
+
+    def _manager(self):
+        return imslib.FileSystemManager(self.ims)
+
+    def _selected_name(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        return item.text().strip()
+
+    def refresh(self):
+        if self.ims == "trial_mode":
+            self.table.setRowCount(0)
+            return
+
+        try:
+            viewer = self._viewer()
+
+            entries = []
+            for entry in viewer:
+                name = str(entry.Name).strip()
+                if not name:
+                    name = "<unnamed>"
+                entries.append(
+                    (
+                        name,
+                        filesystem_type_to_text(entry.Type),
+                        "Yes" if bool(entry.IsDefault) else "No",
+                    )
+                )
+
+            self.table.setRowCount(len(entries))
+            for row, (name, typ, default_text) in enumerate(entries):
+                self.table.setItem(row, 0, QTableWidgetItem(name))
+                self.table.setItem(row, 1, QTableWidgetItem(typ))
+                self.table.setItem(row, 2, QTableWidgetItem(default_text))
+
+            if entries:
+                self.table.selectRow(0)
+
+        except Exception as e:
+            error_box(f"Failed to read device file table: {e}")
+
+    def set_selected_default(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        try:
+            ok = self._manager().SetDefault(name)
+            if not ok:
+                raise RuntimeError(f"SetDefault returned False for '{name}'")
+            self.refresh()
+        except Exception as e:
+            error_box(f"Failed to set default: {e}")
+
+    def clear_selected_default(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        try:
+            ok = self._manager().ClearDefault(name)
+            if not ok:
+                raise RuntimeError(f"ClearDefault returned False for '{name}'")
+            self.refresh()
+        except Exception as e:
+            error_box(f"Failed to clear default: {e}")
+
+    def delete_selected(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        ans = QMessageBox.question(
+            self,
+            "Delete File",
+            f"Delete '{name}' from device storage?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            ok = self._manager().Delete(name)
+            if not ok:
+                raise RuntimeError(f"Delete returned False for '{name}'")
+
+            try:
+                self._manager().Sanitize()
+            except Exception:
+                pass
+
+            self.refresh()
+
+        except Exception as e:
+            error_box(f"Failed to delete file: {e}")
+
+    def delete_all(self):
+        ans = QMessageBox.warning(
+            self,
+            "Delete All Files",
+            "Delete all stored files from device storage?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            viewer = self._viewer()
+            names = []
+
+            for entry in viewer:
+                name = str(entry.Name).strip()
+                if name:
+                    names.append(name)
+
+            if not names:
+                QMessageBox.information(self, "Delete All", "No stored files were found.")
+                return
+
+            fsm = self._manager()
+            failed = []
+
+            for name in names:
+                try:
+                    ok = fsm.Delete(name)
+                    if not ok:
+                        failed.append(name)
+                except Exception:
+                    failed.append(name)
+
+            try:
+                fsm.Sanitize()
+            except Exception:
+                pass
+
+            self.refresh()
+
+            if failed:
+                QMessageBox.warning(
+                    self,
+                    "Delete All Complete",
+                    "Some files could not be deleted:\n- " + "\n- ".join(failed),
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Delete All Complete",
+                    "All stored files were deleted successfully.",
+                )
+
+        except Exception as e:
+            error_box(f"Failed to delete all files: {e}")
+
 
 # -------------------------------------------------
 # Compensation plotting helpers
@@ -947,7 +1190,7 @@ class MplCanvas(FigureCanvas):
 
 
 class CompensationWidget(QWidget):
-    def __init__(self, ims, sp=None):
+    def __init__(self, ims, sp=None, nvm_widget=None):
         super().__init__()
         self.ims = ims
         self.sp = sp
@@ -958,6 +1201,8 @@ class CompensationWidget(QWidget):
         self.global_table = None
         self.channel_tables = {}
         self.channel_count = 0
+
+        self.nvm_widget = nvm_widget
 
         root = QVBoxLayout(self)
 
@@ -1020,6 +1265,7 @@ class CompensationWidget(QWidget):
         store_lay.addWidget(self.ed_store_name, 0, 1)
         store_lay.addWidget(self.lbl_store_hint, 1, 0, 1, 2)
 
+        self.device_files = DeviceFileTableWidget(ims)
         root.addWidget(store_box)
 
         btns = QHBoxLayout()
@@ -1307,24 +1553,30 @@ class CompensationWidget(QWidget):
 
             if self.is_global_lut and self.global_table is not None:
                 ctdl = imslib.CompensationTableDownload(self.ims, self.global_table)
-                ctdl.Store(imslib.FileDefault_NON_DEFAULT, base_name)
+                ok = ctdl.Store(imslib.FileDefault_DEFAULT, base_name)
 
-                QMessageBox.information(
-                    self,
-                    "Stored",
-                    f"Stored global LUT in device non-volatile memory as '{base_name}'."
-                )
+                if ok:
+                    if self.nvm_widget is not None:
+                        self.nvm_widget.refresh()
+                    QMessageBox.information(
+                        self,
+                        "Stored",
+                        f"Stored global LUT in device non-volatile memory as '{base_name}'."
+                    )
                 return
 
             stored = []
             for ch in sorted(self.channel_tables.keys()):
                 name = f"{base_name}_CH{ch}"
                 ctdl = imslib.CompensationTableDownload(self.ims, self.channel_tables[ch])
-                ctdl.Store(imslib.FileDefault_NON_DEFAULT, name)
+                ctdl.Store(imslib.FileDefault_DEFAULT, name)
                 stored.append(name)
 
             if not stored:
                 raise RuntimeError("No channel LUT data was found to store.")
+
+            if self.nvm_widget is not None:
+                self.nvm_widget.refresh()
 
             QMessageBox.information(
                 self,
@@ -1335,6 +1587,233 @@ class CompensationWidget(QWidget):
 
         except Exception as e:
             error_box(str(e))
+
+
+# -------------------------------------------------
+# Non-volatile memory file viewer and manager
+# -------------------------------------------------
+class NVMFilesWidget(QWidget):
+    def __init__(self, ims):
+        super().__init__()
+        self.ims = ims
+
+        root = QVBoxLayout(self)
+
+        info = QLabel(
+            "View files stored in device non-volatile memory, change whether a file is default, "
+            "and delete selected or all entries."
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Type", "Default"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
+        root.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_set_default = QPushButton("Set Default")
+        self.btn_clear_default = QPushButton("Clear Default")
+        self.btn_delete_selected = QPushButton("Delete Selected")
+        self.btn_delete_all = QPushButton("Delete All")
+
+        btn_row.addWidget(self.btn_refresh)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_set_default)
+        btn_row.addWidget(self.btn_clear_default)
+        btn_row.addWidget(self.btn_delete_selected)
+        btn_row.addWidget(self.btn_delete_all)
+
+        root.addLayout(btn_row)
+
+        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_set_default.clicked.connect(self.set_selected_default)
+        self.btn_clear_default.clicked.connect(self.clear_selected_default)
+        self.btn_delete_selected.clicked.connect(self.delete_selected)
+        self.btn_delete_all.clicked.connect(self.delete_all)
+
+        if self.ims == "trial_mode":
+            for btn in (
+                self.btn_refresh,
+                self.btn_set_default,
+                self.btn_clear_default,
+                self.btn_delete_selected,
+                self.btn_delete_all,
+            ):
+                btn.setEnabled(False)
+                btn.setToolTip("Trial mode: no device connected")
+        else:
+            self.refresh()
+
+    def _selected_name(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        return item.text()
+
+    def refresh(self):
+        self.table.setRowCount(0)
+
+        if self.ims == "trial_mode":
+            return
+
+        try:
+            viewer = imslib.FileSystemTableViewer(self.ims)
+
+            if not viewer.IsValid:
+                return
+
+            self.table.setRowCount(len(viewer))
+            for row, entry in enumerate(viewer):
+                name = str(entry.Name)
+                typ = filesystem_type_to_text(entry.Type)
+                default_text = "✓" if bool(entry.IsDefault) else ""
+
+                item_default = QTableWidgetItem(default_text)
+                item_default.setTextAlignment(Qt.AlignCenter)
+
+                self.table.setItem(row, 0, QTableWidgetItem(name))
+                self.table.setItem(row, 1, QTableWidgetItem(typ))
+                self.table.setItem(row, 2, QTableWidgetItem(item_default))
+
+            if len(viewer):
+                self.table.selectRow(0)
+
+        except Exception as e:
+            error_box(f"Failed to read device files: {e}")
+
+    def set_selected_default(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        try:
+            fsm = imslib.FileSystemManager(self.ims)
+            ok = fsm.SetDefault(name)
+            if not ok:
+                raise RuntimeError(f"SetDefault returned False for '{name}'")
+            self.refresh()
+        except Exception as e:
+            error_box(f"Failed to set default: {e}")
+
+    def clear_selected_default(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        try:
+            fsm = imslib.FileSystemManager(self.ims)
+            ok = fsm.ClearDefault(name)
+            if not ok:
+                raise RuntimeError(f"ClearDefault returned False for '{name}'")
+            self.refresh()
+        except Exception as e:
+            error_box(f"Failed to clear default: {e}")
+
+    def delete_selected(self):
+        name = self._selected_name()
+        if not name:
+            error_box("Select a file first.")
+            return
+
+        ans = QMessageBox.question(
+            self,
+            "Delete File",
+            f"Delete '{name}' from device storage?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            fsm = imslib.FileSystemManager(self.ims)
+            ok = fsm.Delete(name)
+            if not ok:
+                raise RuntimeError(f"Delete returned False for '{name}'")
+
+            try:
+                fsm.Sanitize()
+            except Exception:
+                pass
+
+            self.refresh()
+
+        except Exception as e:
+            error_box(f"Failed to delete file: {e}")
+
+    def delete_all(self):
+        ans = QMessageBox.warning(
+            self,
+            "Delete All Files",
+            "Delete all stored files from device storage?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            viewer = imslib.FileSystemTableViewer(self.ims)
+            if not viewer.IsValid:
+                return
+
+            names = [str(entry.Name) for entry in viewer if str(entry.Name)]
+
+            if not names:
+                QMessageBox.information(self, "Delete All", "No files found.")
+                return
+
+            fsm = imslib.FileSystemManager(self.ims)
+            failed = []
+
+            for name in names:
+                try:
+                    ok = fsm.Delete(name)
+                    if not ok:
+                        failed.append(name)
+                except Exception:
+                    failed.append(name)
+
+            try:
+                fsm.Sanitize()
+            except Exception:
+                pass
+
+            self.refresh()
+
+            if failed:
+                QMessageBox.warning(
+                    self,
+                    "Delete All",
+                    "Some files could not be deleted:\n- " + "\n- ".join(failed)
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Delete All",
+                    "All files deleted successfully."
+                )
+
+        except Exception as e:
+            error_box(f"Failed to delete all files: {e}")
 
 
 # -------------------------------------------------
@@ -1544,14 +2023,16 @@ class MainWindow(QMainWindow):
 
         self.tab_control = control
         self.tab_monitoring = MonitoringWidget(vco, event_bridge)
-        self.tab_comp = CompensationWidget(ims, sp)
         self.tab_advanced = advanced
+        self.tab_comp = CompensationWidget(ims, sp)
+        self.tab_nvm = NVMFilesWidget(ims)
         self.tab_about = AboutWidget(ims)
 
         self.tabs.addTab(self.tab_control, "Control")
         self.tabs.addTab(self.tab_monitoring, "Monitoring")
-        self.tabs.addTab(self.tab_comp, "Compensation")
         self.tabs.addTab(self.tab_advanced, "Advanced")
+        self.tabs.addTab(self.tab_comp, "Compensation")
+        self.tabs.addTab(self.tab_nvm, "NVM Files")
         self.tabs.addTab(self.tab_about, "About")
 
         self.is_trial_mode = (ims == "trial_mode")

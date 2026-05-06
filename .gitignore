@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .venv/
 
+*.docm
+*devices.png
+
 build/
 dist/
 

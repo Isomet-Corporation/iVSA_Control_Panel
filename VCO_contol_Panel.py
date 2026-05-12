@@ -2,11 +2,7 @@ import os
 import re
 import sys
 import time
-import tempfile
-import threading
 
-import csv
-from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -321,7 +317,7 @@ class FilterWidget(QGroupBox):
         layout = QGridLayout(self)
 
         layout.addWidget(QLabel("CIC Length (1-10)"), 0, 0)
-        self.cic_len = QLineEdit("8")
+        self.cic_len = QLineEdit("")
         layout.addWidget(self.cic_len, 0, 1)
 
         btn_cic_on = QPushButton("Enable CIC")
@@ -333,11 +329,11 @@ class FilterWidget(QGroupBox):
         btn_cic_off.clicked.connect(self.disable_cic)
 
         layout.addWidget(QLabel("IIR Cutoff (kHz)"), 1, 0)
-        self.iir_cutoff = QLineEdit("10.0")
+        self.iir_cutoff = QLineEdit("")
         layout.addWidget(self.iir_cutoff, 1, 1)
 
         layout.addWidget(QLabel("Stages (1-8)"), 1, 2)
-        self.iir_stages = QLineEdit("2")
+        self.iir_stages = QLineEdit("")
         layout.addWidget(self.iir_stages, 1, 3)
 
         btn_iir_on = QPushButton("Enable IIR")
@@ -1508,11 +1504,11 @@ class CompensationWidget(QWidget):
             return
 
         try:
-            if self.sp is not None:
-                try:
-                    self.sp.EnableImagePathCompensation(True, True)
-                except Exception:
-                    pass
+            # if self.sp is not None:
+            #     try:
+            #         self.sp.EnableImagePathCompensation(True, True)
+            #     except Exception:
+            #         pass
 
             if self.is_global_lut and self.global_table is not None:
                 self._download_table(self.global_table, "global LUT")
@@ -1818,6 +1814,7 @@ class NVMFilesWidget(QWidget):
             error_box(f"Failed to delete all files: {e}")
 
 
+
 # -------------------------------------------------
 # About tab
 # -------------------------------------------------
@@ -1946,7 +1943,7 @@ class AboutWidget(QWidget):
 # -------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, ims, vco, sp, sysf, event_bridge):
+    def __init__(self, ims, vco, sp, sysf):
         super().__init__()
         self._startup_warning_shown = False
 
@@ -2024,17 +2021,15 @@ class MainWindow(QMainWindow):
         advanced_root.addStretch(1)
 
         self.tab_control = control
-        self.tab_monitoring = MonitoringWidget(vco, event_bridge)
         self.tab_advanced = advanced
         self.tab_comp = CompensationWidget(ims, sp)
         self.tab_nvm = NVMFilesWidget(ims)
         self.tab_about = AboutWidget(ims)
 
         self.tabs.addTab(self.tab_control, "Control")
-        self.tabs.addTab(self.tab_monitoring, "Monitoring")
         self.tabs.addTab(self.tab_advanced, "Advanced")
         self.tabs.addTab(self.tab_comp, "Compensation")
-        self.tabs.addTab(self.tab_nvm, "NVM Files")
+        self.tabs.addTab(self.tab_nvm, "NVM Compensation Files")
         self.tabs.addTab(self.tab_about, "About")
 
         self.is_trial_mode = (ims == "trial_mode")
@@ -2106,223 +2101,6 @@ class MainWindow(QMainWindow):
 
 
 # -------------------------------------------------
-# VCO Monitor Event loop thread
-# -------------------------------------------------
-
-class VCOEventBridge(QObject):
-    voltage_ready = Signal(dict)
-
-    def __init__(self, vco):
-        super().__init__()
-        self.vco = vco
-
-    def on_voltage_read_complete(self):
-        try:
-            data = dict(self.vco.GetVoltageInputDataStr().items())
-            self.voltage_ready.emit(data)
-        except Exception as e:
-            print("Voltage read error:", e)
-
-
-class VCOEventLoop(threading.Thread):
-    def __init__(self, vco, waiter, event_messages, event_bridge):
-        super().__init__(daemon=True)
-        self.waiter = waiter
-        self.vco = vco
-        self.event_messages = event_messages
-        self._running = threading.Event()
-        self.event_bridge = event_bridge
-
-    def subscribe(self):
-        for evt in self.event_messages.keys():
-            self.vco.VCOEventSubscribe(evt, self.waiter)
-
-    def unsubscribe(self):
-        for evt in self.event_messages.keys():
-            self.vco.VCOEventUnsubscribe(evt, self.waiter)
-
-    def run(self):
-        self._running.set()
-        self.subscribe()
-        try:
-            while self._running.is_set():
-                try:
-                    msg, args = self.waiter.wait(timeout=0.1)
-                    if msg == imslib.VCOEvents_VCO_UPDATE_AVAILABLE:
-                        self.event_bridge.on_voltage_read_complete()
-                except TimeoutError:
-                    continue
-        finally:
-            self.unsubscribe()
-
-    def stop(self):
-        self._running.clear()
-
-
-VCO_EVENT_MESSAGES = {
-    imslib.VCOEvents_VCO_UPDATE_AVAILABLE: "VCO Update",
-    imslib.VCOEvents_VCO_READ_FAILED: "VCO Read Failed",
-}
-
-class MonitoringWidget(QGroupBox):
-    def __init__(self, vco, event_bridge):
-        super().__init__("Input Monitoring")
-        self.vco = vco
-
-        layout = QGridLayout(self)
-        self.displays = {}
-
-        labels = [
-            "Voltage Input Ch A",
-            "Voltage Input Ch B",
-            "Processed Value Ch A",
-            "Processed Value Ch B",
-        ]
-
-        for row, name in enumerate(labels):
-            layout.addWidget(QLabel(name), row, 0)
-
-            lcd = QLCDNumber()
-            lcd.setDigitCount(7)
-            lcd.setSmallDecimalPoint(True)
-            lcd.setSegmentStyle(QLCDNumber.Flat)
-            lcd.display("0.000")
-
-            layout.addWidget(lcd, row, 1)
-            layout.addWidget(QLabel("Volts" if "Voltage" in name else "%"), row, 2)
-
-            self.displays[name] = lcd
-
-        # --- Recording state ---
-        self.is_recording = False
-        self.csv_file = None
-        self.csv_writer = None
-        self.sample_count = 0
-
-        # Record button
-        self.btn_record = QPushButton("Record Data")
-        self.btn_record.setCheckable(True)
-        self.btn_record.clicked.connect(self.toggle_recording)
-        layout.addWidget(self.btn_record, len(labels), 0, 1, 3)
-
-        # Sample counter display (optional but useful)
-        self.lbl_samples = QLabel("Samples: 0")
-        layout.addWidget(self.lbl_samples, len(labels)+1, 0, 1, 3)
-
-        if event_bridge is not None:
-            event_bridge.voltage_ready.connect(self.update_values)
-
-        # Polling timer (drives acquisition request)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.request_update)
-        self.timer.start(200)  # 5 Hz
-
-        # Flush timer (prevents data loss without killing performance)
-        self.flush_timer = QTimer(self)
-        self.flush_timer.timeout.connect(self.flush_file)
-        self.flush_timer.start(1000)  # flush every 1 second
-
-    def toggle_recording(self):
-        self.is_recording = not self.is_recording
-
-        if self.is_recording:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self,
-                "Save Recording",
-                f"monitoring_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "CSV Files (*.csv)"
-            )
-
-            if not file_path:
-                self.is_recording = False
-                return
-
-            try:
-                self.csv_file = open(file_path, "w", newline="")
-                self.csv_writer = None
-                self.sample_count = 0
-
-                self.btn_record.setText("Stop Recording")
-                self.btn_record.setStyleSheet("background-color: red; color: white;")
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
-                self.is_recording = False
-
-        else:
-            self.stop_recording()
-
-    def stop_recording(self):
-        if self.csv_file:
-            try:
-                self.csv_file.flush()
-                self.csv_file.close()
-            except Exception:
-                pass
-
-        self.csv_file = None
-        self.csv_writer = None
-
-        self.btn_record.setText("Record Data")
-        self.btn_record.setStyleSheet("")
-
-    def flush_file(self):
-        if self.csv_file:
-            try:
-                self.csv_file.flush()
-            except Exception:
-                pass
-
-    def request_update(self):
-        try:
-            if self.vco is None:
-                return
-            self.vco.ReadVoltageInput()
-        except Exception as e:
-            print("ReadVoltageInput failed:", e)
-
-    def update_values(self, data):
-        row = {}
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-
-        # Build row from *every* incoming dataset
-        for key, percent_obj in data.items():
-            if key not in self.displays:
-                continue
-            try:
-                value = float(percent_obj)
-                if "Voltage" in key:
-                    value /= 10.0
-
-                self.displays[key].display(f"{value:.3f}")
-                row[key] = value
-
-            except Exception as e:
-                print(f"Failed to update {key}: {e}")
-
-        # --- Critical: write EVERY sample received ---
-        if self.is_recording and row:
-            row["Timestamp"] = timestamp
-
-            try:
-                if self.csv_writer is None:
-                    headers = ["Timestamp"] + list(row.keys())
-                    headers = list(dict.fromkeys(headers))
-                    self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=headers)
-                    self.csv_writer.writeheader()
-
-                self.csv_writer.writerow(row)
-
-                # Track exact number of samples written
-                self.sample_count += 1
-                self.lbl_samples.setText(f"Samples: {self.sample_count}")
-
-            except Exception as e:
-                print("CSV write error:", e)
-
-
-
-# -------------------------------------------------
 # Startup Warning Dialog
 # -------------------------------------------------
 class StartupWarningDialog(QDialog):
@@ -2380,9 +2158,6 @@ def main():
     vco = None
     sp = None
     sysf = None
-    event_bridge = None
-    vco_event_loop = None
-
     if ims == "trial_mode":
         QMessageBox.information(None, "Mode", "Trial mode selected.")
     else:
@@ -2390,28 +2165,15 @@ def main():
 
         vco = VCO(ims)
 
-        VCOWaiter = EventWaiter()
-        VCOWaiter.listen_for(list(VCO_EVENT_MESSAGES.keys()))
-
-        event_bridge = VCOEventBridge(vco)
-        vco_event_loop = VCOEventLoop(vco, VCOWaiter, VCO_EVENT_MESSAGES, event_bridge)
-        vco_event_loop.start()
-
         sp = imslib.SignalPath(ims)
         sysf = imslib.SystemFunc(ims)
 
         sp.PhaseResync()
 
-    win = MainWindow(ims, vco, sp, sysf, event_bridge)
+    win = MainWindow(ims, vco, sp, sysf)
     win.show()
     win.resize(500, 600)
     rc = app.exec()
-
-    try:
-        if vco_event_loop is not None:
-            vco_event_loop.stop()
-    except Exception:
-        pass
 
     try:
         if ims != "trial_mode":

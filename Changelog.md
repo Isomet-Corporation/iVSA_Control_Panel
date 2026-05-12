@@ -1,4 +1,8 @@
 # Changelog
+## [1.0.4] - 2026-05-12
+### Removed
+- Monitioring tab and all related functions to aid comms stability
+
 ## [1.0.3] - 2026-05-05
 ### Added
 - record to csv for monitoring tab
